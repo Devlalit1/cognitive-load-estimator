@@ -100,10 +100,15 @@ python src/model.py --train
 
 ### Deployment note
 
-The current dashboard opens the webcam with OpenCV on the machine running
-Streamlit. It works when run locally, but a cloud deployment cannot access
-the webcam attached to your browser's computer. Remote webcam use requires
-browser-side camera capture and sending frames to the app.
+The live monitor captures video in the browser with WebRTC and streams frames
+to the Streamlit server for analysis. Start the camera from the video panel and
+grant the browser permission. Raw video frames are processed in memory and are
+not saved; recorded sessions contain estimates only. Some restrictive networks
+may require a TURN server in addition to the configured STUN server.
+
+The MediaPipe Face Landmarker asset is included at
+`models/face_landmarker.task` so both local and cloud runs can initialize the
+detector.
 
 Streamlit Community Cloud also needs the Linux `libgl1` and `libglib2.0-0`
 system packages for OpenCV; these are declared in the root `packages.txt`.

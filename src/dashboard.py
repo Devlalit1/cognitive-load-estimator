@@ -2,32 +2,29 @@
 
 from __future__ import annotations
 
-import base64
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import cv2
 import pandas as pd
 import streamlit as st
+from streamlit_webrtc import WebRtcMode, webrtc_streamer
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from capture import WebcamCapture
-from face_mesh import FaceMeshExtractor
-from features import FeatureExtractor
+from browser_stream_state import BrowserStreamState
+from browser_video import BrowserFaceVideoProcessor
 from model import CognitiveLoadModel, LABEL_NAMES
 from session_report import build_session_report, format_duration
-from window_buffer import SlidingWindowBuffer, WindowFeatures
+from window_buffer import WindowFeatures
 
 MODEL_PATH = Path(__file__).parent.parent / "data" / "trained_model.pkl"
 SESSION_DIR = Path(__file__).parent.parent / "data" / "sessions"
-WINDOW_SECS = 30
-SAMPLE_INTERVAL_SECS = 1.0
-DISPLAY_INTERVAL_SECS = 0.2
 HISTORY_ROWS = 300
+RTC_CONFIGURATION = {
+    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}],
+}
 
 LOAD_STYLE = {
     "Low": ("🟢", "#1a9850"),
@@ -47,22 +44,20 @@ DEFAULTS = {
     "session_history": [],
     "session_name": None,
     "session_started_at": None,
-    "camera": None,
-    "face_mesh": None,
-    "feature_extractor": None,
-    "window_buffer": None,
-    "last_sample_ts": 0.0,
-    "last_display_ts": 0.0,
-    "camera_error": None,
+    "browser_stream_state": None,
+    "last_processed_sample_id": 0,
     "high_since": None,
     "alert_shown": False,
-    "run_camera": False,
     "record_data": False,
     "alert_on": True,
 }
 for key, value in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = value
+
+if st.session_state["browser_stream_state"] is None:
+    st.session_state["browser_stream_state"] = BrowserStreamState()
+browser_stream_state: BrowserStreamState = st.session_state["browser_stream_state"]
 
 
 @st.cache_resource
@@ -93,23 +88,6 @@ def rule_based_load(features: WindowFeatures) -> tuple[int, str]:
     return 0, "Low"
 
 
-def close_camera_resources() -> None:
-    camera = st.session_state.get("camera")
-    if camera is not None:
-        camera.release()
-        st.session_state["camera"] = None
-
-    face_mesh = st.session_state.get("face_mesh")
-    if face_mesh is not None:
-        face_mesh.close()
-        st.session_state["face_mesh"] = None
-
-    st.session_state["feature_extractor"] = None
-    st.session_state["window_buffer"] = None
-    st.session_state["last_sample_ts"] = 0.0
-    st.session_state["last_display_ts"] = 0.0
-
-
 model = get_model()
 
 st.title("🧠 Cognitive Load Monitor")
@@ -121,9 +99,10 @@ st.caption(
 with st.sidebar:
     st.header("Session controls")
     st.toggle("Record this session", key="record_data")
-    st.toggle("Start camera", key="run_camera")
     st.toggle("High-load alert", key="alert_on")
-    st.caption("Turn on recording before or during a live session.")
+    st.caption(
+        "Start the browser camera below; recording is optional and stores estimates only."
+    )
     if st.session_state["session_name"]:
         st.caption(f"Session: `{st.session_state['session_name']}`")
     if model is None:
@@ -136,112 +115,57 @@ live_tab, report_tab, guidance_tab = st.tabs(
     ["Live monitor", "Session brief", "How to interpret"]
 )
 
-@st.fragment(run_every=0.1)
+@st.fragment(run_every=1.0)
 def render_live_monitor() -> None:
-    camera_column, metrics_column = st.columns([1.25, 1])
-    camera_status = camera_column.empty()
-    camera_frame = camera_column.empty()
-    live_load = metrics_column.empty()
-    metric_row = metrics_column.container()
-    trend_container = st.container()
+    stream_state: BrowserStreamState = st.session_state["browser_stream_state"]
+    snapshot = stream_state.snapshot()
     alert_status = st.empty()
 
-    if not st.session_state["run_camera"]:
-        close_camera_resources()
-        if st.session_state["camera_error"]:
-            camera_status.error(st.session_state["camera_error"])
-            st.session_state["camera_error"] = None
+    if snapshot.error:
+        st.error(snapshot.error)
+    elif snapshot.running and snapshot.frames_received:
+        if snapshot.face_found:
+            st.success("Face detected")
         else:
-            camera_status.info("Turn on **Start camera** to begin.")
-        if st.session_state["history"]:
-            render_live_metrics(live_load, metric_row)
-            render_live_trends(trend_container)
-        return
+            st.warning("No face detected — adjust lighting or position.")
+    elif snapshot.running:
+        st.info("Waiting for video frames from your browser.")
+    else:
+        st.info("Use **Start** in the video panel to grant browser camera access.")
 
-    if st.session_state["camera_error"]:
-        camera_status.error(st.session_state["camera_error"])
-        return
-
-    try:
-        if st.session_state["camera"] is None:
-            camera = WebcamCapture(source=0)
-            camera.open()
-            st.session_state["camera"] = camera
-        if st.session_state["face_mesh"] is None:
-            st.session_state["face_mesh"] = FaceMeshExtractor()
-            st.session_state["feature_extractor"] = FeatureExtractor()
-            st.session_state["window_buffer"] = SlidingWindowBuffer(
-                window_seconds=WINDOW_SECS
-            )
-    except Exception as exc:
-        close_camera_resources()
-        st.session_state["camera_error"] = (
-            f"Camera or face detector could not start: {type(exc).__name__}: {exc}. "
-            "Check camera access and the Face Landmarker model."
+    if (
+        snapshot.latest_features is not None
+        and snapshot.sample_timestamp is not None
+        and snapshot.sample_id > st.session_state["last_processed_sample_id"]
+    ):
+        record = make_estimate(
+            snapshot.latest_features,
+            snapshot.sample_timestamp,
+            snapshot.buffered_frames,
         )
-        camera_status.error(st.session_state["camera_error"])
-        return
+        history = st.session_state["history"]
+        history.append(record)
+        st.session_state["history"] = history[-HISTORY_ROWS:]
+        st.session_state["last_processed_sample_id"] = snapshot.sample_id
 
-    camera = st.session_state["camera"]
-    face_mesh = st.session_state["face_mesh"]
-    ok, bgr_frame, rgb_frame = camera.read_frame()
-    if not ok or bgr_frame is None or rgb_frame is None:
-        camera_status.error("Webcam frame capture failed. Check the camera connection.")
-        close_camera_resources()
-        return
+        if st.session_state["record_data"]:
+            if st.session_state["session_name"] is None:
+                st.session_state["session_name"] = datetime.now().strftime(
+                    "%Y%m%d_%H%M%S"
+                )
+                st.session_state["session_started_at"] = snapshot.sample_timestamp
+            st.session_state["session_history"].append(record)
 
-    now = time.time()
-    result = face_mesh.process(rgb_frame)
-    frame_features = st.session_state["feature_extractor"].extract(
-        result, timestamp=now
-    )
-    buffer = st.session_state["window_buffer"]
-    buffer.push(frame_features)
+        update_load_alert(record, alert_status)
 
-    annotated = face_mesh.draw_landmarks(bgr_frame, result)
-    if now - st.session_state["last_display_ts"] >= DISPLAY_INTERVAL_SECS:
-        encoded_ok, encoded_frame = cv2.imencode(
-            ".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 78]
-        )
-        if not encoded_ok:
-            raise RuntimeError("OpenCV failed to encode the webcam frame as JPEG")
-        image_data = base64.b64encode(encoded_frame).decode("ascii")
-        camera_frame.markdown(
-            f"<img src='data:image/jpeg;base64,{image_data}' "
-            "style='width:100%;height:auto;border-radius:10px' "
-            "alt='Live webcam frame'>",
-            unsafe_allow_html=True,
-        )
-        st.session_state["last_display_ts"] = now
-    camera_status.caption(
-        "Face detected" if result.face_found else "No face detected — adjust lighting or position"
-    )
+    if st.session_state["history"]:
+        render_live_metrics(st.empty(), st.container())
 
-    if now - st.session_state["last_sample_ts"] >= SAMPLE_INTERVAL_SECS:
-        window_features = buffer.aggregate()
-        st.session_state["last_sample_ts"] = now
-        if window_features is not None:
-            record = make_estimate(window_features, now, buffer.buffer_size)
-            history = st.session_state["history"]
-            history.append(record)
-            st.session_state["history"] = history[-HISTORY_ROWS:]
 
-            if st.session_state["record_data"]:
-                if st.session_state["session_name"] is None:
-                    st.session_state["session_name"] = datetime.now().strftime(
-                        "%Y%m%d_%H%M%S"
-                    )
-                    st.session_state["session_started_at"] = now
-                st.session_state["session_history"].append(record)
-
-            render_live_metrics(live_load, metric_row)
-            render_live_trends(trend_container)
-            update_load_alert(record, alert_status)
-        else:
-            camera_status.caption(
-                "Collecting valid face frames; estimates appear after enough landmarks "
-                "are available."
-            )
+@st.fragment(run_every=1.0)
+def render_live_trends_fragment() -> None:
+    if st.session_state["history"]:
+        render_live_trends(st.container())
 
 
 def make_estimate(
@@ -394,7 +318,34 @@ def render_session_brief() -> None:
 
 
 with live_tab:
-    render_live_monitor()
+    camera_column, metrics_column = st.columns([1.25, 1])
+    with camera_column:
+        st.subheader("Browser camera")
+        webrtc_streamer(
+            key="cognitive-load-camera",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 640},
+                    "height": {"ideal": 480},
+                    "frameRate": {"ideal": 15, "max": 20},
+                },
+                "audio": False,
+            },
+            video_processor_factory=lambda: BrowserFaceVideoProcessor(
+                browser_stream_state
+            ),
+            async_processing=True,
+            video_receiver_size=1,
+        )
+        st.caption(
+            "Video is streamed to the app server for analysis. Raw frames are not "
+            "saved; recorded sessions contain estimates only."
+        )
+    with metrics_column:
+        render_live_monitor()
+    render_live_trends_fragment()
 
 with report_tab:
     st.header("Session brief")
