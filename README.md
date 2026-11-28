@@ -105,6 +105,9 @@ Streamlit. It works when run locally, but a cloud deployment cannot access
 the webcam attached to your browser's computer. Remote webcam use requires
 browser-side camera capture and sending frames to the app.
 
+Streamlit Community Cloud also needs the Linux `libgl1` system package for
+OpenCV; this is declared in the root `packages.txt`.
+
 ---
 
 ## Features Extracted
