@@ -1,129 +1,90 @@
-"""
-dashboard.py – Real-time Cognitive Load Estimator dashboard (Streamlit).
-
-Run:  streamlit run src/dashboard.py
-
-Layout
-------
-Left column  : Live webcam feed with landmark overlay + current load badge
-Right column : Time-series graphs (EAR, blink rate, PERCLOS, load score)
-Sidebar      : Controls – start/stop recording, export CSV, alert threshold
-Bottom       : Session stats table
-"""
+"""Live cognitive-load dashboard with session recording and brief reports."""
 
 from __future__ import annotations
 
 import base64
 import sys
-import os
 import time
-import threading
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 import cv2
-import numpy as np
 import pandas as pd
 import streamlit as st
 
-# -- ensure src/ is importable when launched from project root --------
 sys.path.insert(0, str(Path(__file__).parent))
 
 from capture import WebcamCapture
 from face_mesh import FaceMeshExtractor
-from features import FeatureExtractor, FrameFeatures
-from window_buffer import SlidingWindowBuffer, WindowFeatures, FEATURE_NAMES
-from model import CognitiveLoadModel, LABEL_NAMES, LABEL_COLORS
+from features import FeatureExtractor
+from model import CognitiveLoadModel, LABEL_NAMES
+from session_report import build_session_report, format_duration
+from window_buffer import SlidingWindowBuffer, WindowFeatures
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-MODEL_PATH   = Path(__file__).parent.parent / "data" / "trained_model.pkl"
-SESSION_DIR  = Path(__file__).parent.parent / "data" / "sessions"
-ALERT_SECS   = 60          # seconds of High load before alert fires
-WINDOW_SECS  = 30
-HISTORY_ROWS = 300         # rows kept in live graph
+MODEL_PATH = Path(__file__).parent.parent / "data" / "trained_model.pkl"
+SESSION_DIR = Path(__file__).parent.parent / "data" / "sessions"
+WINDOW_SECS = 30
+SAMPLE_INTERVAL_SECS = 1.0
+DISPLAY_INTERVAL_SECS = 0.2
+HISTORY_ROWS = 300
 
-LOAD_BADGE = {
-    "Low":    ("🟢 Low",    "#1a9850"),
-    "Medium": ("🟡 Medium", "#fdae61"),
-    "High":   ("🔴 High",   "#d73027"),
+LOAD_STYLE = {
+    "Low": ("🟢", "#1a9850"),
+    "Medium": ("🟡", "#fdae61"),
+    "High": ("🔴", "#d73027"),
+    "Unknown": ("⚪", "#657080"),
 }
 
-
-# ---------------------------------------------------------------------------
-# Streamlit page config
-# ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="Cognitive Load Estimator",
     page_icon="🧠",
     layout="wide",
 )
 
-st.title("🧠 Real-Time Cognitive Load Estimator")
-st.caption("Powered by MediaPipe FaceMesh + Random Forest")
-
-
-# ---------------------------------------------------------------------------
-# Sidebar controls
-# ---------------------------------------------------------------------------
-with st.sidebar:
-    st.header("⚙️ Controls")
-    run_camera  = st.toggle("▶ Start Camera", value=False)
-    record_data = st.toggle("⏺ Record Session", value=False)
-    alert_on    = st.toggle("🔔 High-Load Alert (>60 s)", value=True)
-    st.divider()
-    st.subheader("Export")
-    export_btn  = st.button("💾 Export Session CSV")
-    st.divider()
-    st.subheader("Model")
-    model_info  = st.empty()
-
-
-# ---------------------------------------------------------------------------
-# Session state initialisation
-# ---------------------------------------------------------------------------
-defaults = {
-    "history":      [],         # list of dicts – one per window update
-    "frame_buf":    [],         # raw FrameFeatures list for recording
-    "high_since":   None,       # timestamp when last High load started
-    "alert_shown":  False,
-    "recording":    False,
+DEFAULTS = {
+    "history": [],
+    "session_history": [],
     "session_name": None,
+    "session_started_at": None,
+    "camera": None,
+    "face_mesh": None,
+    "feature_extractor": None,
+    "window_buffer": None,
+    "last_sample_ts": 0.0,
+    "last_display_ts": 0.0,
+    "camera_error": None,
+    "high_since": None,
+    "alert_shown": False,
+    "run_camera": False,
+    "record_data": False,
+    "alert_on": True,
 }
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
-# ---------------------------------------------------------------------------
-# Load model (graceful fallback if not yet trained)
-# ---------------------------------------------------------------------------
 @st.cache_resource
-def _load_model():
-    if MODEL_PATH.exists():
-        try:
-            return CognitiveLoadModel.load(MODEL_PATH)
-        except Exception as e:
-            st.warning(f"Could not load model: {e}. Using rule-based fallback.")
-    return None
-
-model = _load_model()
-model_info.write("✅ Trained model loaded" if model else "⚠️ No model – rule-based fallback")
+def get_model() -> CognitiveLoadModel | None:
+    if not MODEL_PATH.exists():
+        return None
+    try:
+        return CognitiveLoadModel.load(MODEL_PATH)
+    except (OSError, ValueError, KeyError) as exc:
+        st.warning(f"Trained model could not be loaded: {exc}")
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Rule-based fallback when model is not yet trained
-# ---------------------------------------------------------------------------
-def _rule_based_load(wf: WindowFeatures) -> tuple[int, str]:
+def rule_based_load(features: WindowFeatures) -> tuple[int, str]:
     score = 0
-    if wf.blink_rate < 10 or wf.blink_rate > 25:
+    if features.blink_rate < 10 or features.blink_rate > 25:
         score += 1
-    if wf.perclos > 0.15:
+    if features.perclos > 0.15:
         score += 1
-    if wf.ear_mean_avg < 0.22:
+    if features.ear_mean_avg < 0.22:
         score += 1
-    if wf.au4_mean < 0.6:    # brows closer = furrow
+    if features.au4_mean < 0.6:
         score += 1
     if score >= 3:
         return 2, "High"
@@ -132,134 +93,328 @@ def _rule_based_load(wf: WindowFeatures) -> tuple[int, str]:
     return 0, "Low"
 
 
-# ---------------------------------------------------------------------------
-# Main camera loop (runs in Streamlit fragment to avoid full rerenders)
-# ---------------------------------------------------------------------------
-col_cam, col_charts = st.columns([1, 1])
+def close_camera_resources() -> None:
+    camera = st.session_state.get("camera")
+    if camera is not None:
+        camera.release()
+        st.session_state["camera"] = None
 
-frame_placeholder = col_cam.empty()
-badge_placeholder  = col_cam.empty()
-alert_placeholder  = col_cam.empty()
+    face_mesh = st.session_state.get("face_mesh")
+    if face_mesh is not None:
+        face_mesh.close()
+        st.session_state["face_mesh"] = None
 
-chart_ear    = col_charts.empty()
-chart_blink  = col_charts.empty()
-chart_perclos = col_charts.empty()
-chart_load   = col_charts.empty()
-
-stats_table  = st.empty()
-
-# ---------------------------------------------------------------------------
-# Export handler
-# ---------------------------------------------------------------------------
-if export_btn and st.session_state["history"]:
-    df = pd.DataFrame(st.session_state["history"])
-    sname = st.session_state["session_name"] or "session"
-    fname = SESSION_DIR / f"{sname}.csv"
-    SESSION_DIR.mkdir(parents=True, exist_ok=True)
-    df.to_csv(fname, index=False)
-    st.sidebar.success(f"Saved → {fname.name}")
+    st.session_state["feature_extractor"] = None
+    st.session_state["window_buffer"] = None
+    st.session_state["last_sample_ts"] = 0.0
+    st.session_state["last_display_ts"] = 0.0
 
 
-# ---------------------------------------------------------------------------
-# Camera loop
-# ---------------------------------------------------------------------------
-if run_camera:
-    if st.session_state["session_name"] is None:
-        st.session_state["session_name"] = datetime.now().strftime("%Y%m%d_%H%M%S")
+model = get_model()
 
-    cam = WebcamCapture(source=0)
-    cam.open()
-    fme = FaceMeshExtractor()
-    extractor = FeatureExtractor()
-    buf = SlidingWindowBuffer(window_seconds=WINDOW_SECS)
-    last_display = 0.0
+st.title("🧠 Cognitive Load Monitor")
+st.caption(
+    "Facial-behavior estimates for reflection and research—not a clinical or "
+    "diagnostic assessment."
+)
+
+with st.sidebar:
+    st.header("Session controls")
+    st.toggle("Record this session", key="record_data")
+    st.toggle("Start camera", key="run_camera")
+    st.toggle("High-load alert", key="alert_on")
+    st.caption("Turn on recording before or during a live session.")
+    if st.session_state["session_name"]:
+        st.caption(f"Session: `{st.session_state['session_name']}`")
+    if model is None:
+        st.info("Rule-based estimates · no trained model found")
+    else:
+        st.success("Trained model loaded")
+
+
+live_tab, report_tab, guidance_tab = st.tabs(
+    ["Live monitor", "Session brief", "How to interpret"]
+)
+
+@st.fragment(run_every=0.1)
+def render_live_monitor() -> None:
+    camera_column, metrics_column = st.columns([1.25, 1])
+    camera_status = camera_column.empty()
+    camera_frame = camera_column.empty()
+    live_load = metrics_column.empty()
+    metric_row = metrics_column.container()
+    trend_container = st.container()
+    alert_status = st.empty()
+
+    if not st.session_state["run_camera"]:
+        close_camera_resources()
+        if st.session_state["camera_error"]:
+            camera_status.error(st.session_state["camera_error"])
+            st.session_state["camera_error"] = None
+        else:
+            camera_status.info("Turn on **Start camera** to begin.")
+        if st.session_state["history"]:
+            render_live_metrics(live_load, metric_row)
+            render_live_trends(trend_container)
+        return
+
+    if st.session_state["camera_error"]:
+        camera_status.error(st.session_state["camera_error"])
+        return
 
     try:
-        for bgr, rgb, ts in cam.frames():
-            frame_started = time.perf_counter()
-            result  = fme.process(rgb)
-            ff      = extractor.extract(result)
-            ff.timestamp = ts
-            buf.push(ff)
+        if st.session_state["camera"] is None:
+            camera = WebcamCapture(source=0)
+            camera.open()
+            st.session_state["camera"] = camera
+        if st.session_state["face_mesh"] is None:
+            st.session_state["face_mesh"] = FaceMeshExtractor()
+            st.session_state["feature_extractor"] = FeatureExtractor()
+            st.session_state["window_buffer"] = SlidingWindowBuffer(
+                window_seconds=WINDOW_SECS
+            )
+    except Exception as exc:
+        close_camera_resources()
+        st.session_state["camera_error"] = (
+            f"Camera or face detector could not start: {type(exc).__name__}: {exc}. "
+            "Check camera access and the Face Landmarker model."
+        )
+        camera_status.error(st.session_state["camera_error"])
+        return
 
-            # -- overlay ---------------------------------------------------
-            annotated = fme.draw_landmarks(bgr, result) if result.face_found else bgr
-            if frame_started - last_display >= 0.2:
-                encoded_ok, encoded_frame = cv2.imencode(
-                    ".jpg",
-                    annotated,
-                    [cv2.IMWRITE_JPEG_QUALITY, 80],
-                )
-                if not encoded_ok:
-                    raise RuntimeError("OpenCV failed to encode the webcam frame as JPEG")
-                image_data = base64.b64encode(encoded_frame).decode("ascii")
-                frame_placeholder.markdown(
-                    f"<img src='data:image/jpeg;base64,{image_data}' "
-                    "style='width:100%;height:auto' alt='Live webcam frame'>",
-                    unsafe_allow_html=True,
-                )
-                last_display = frame_started
+    camera = st.session_state["camera"]
+    face_mesh = st.session_state["face_mesh"]
+    ok, bgr_frame, rgb_frame = camera.read_frame()
+    if not ok or bgr_frame is None or rgb_frame is None:
+        camera_status.error("Webcam frame capture failed. Check the camera connection.")
+        close_camera_resources()
+        return
 
-            # -- aggregate & predict every ~1 s when buffer is ready -------
-            wf = buf.aggregate()
-            if wf is not None:
-                if model:
-                    vec   = wf.to_vector()
-                    label, proba = model.predict(vec)
-                    load_name = LABEL_NAMES[label]
-                else:
-                    label, load_name = _rule_based_load(wf)
+    now = time.time()
+    result = face_mesh.process(rgb_frame)
+    frame_features = st.session_state["feature_extractor"].extract(
+        result, timestamp=now
+    )
+    buffer = st.session_state["window_buffer"]
+    buffer.push(frame_features)
 
-                entry = wf.to_dict()
-                entry.update({"timestamp": ts, "load_label": label, "load_name": load_name})
-                st.session_state["history"].append(entry)
+    annotated = face_mesh.draw_landmarks(bgr_frame, result)
+    if now - st.session_state["last_display_ts"] >= DISPLAY_INTERVAL_SECS:
+        encoded_ok, encoded_frame = cv2.imencode(
+            ".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 78]
+        )
+        if not encoded_ok:
+            raise RuntimeError("OpenCV failed to encode the webcam frame as JPEG")
+        image_data = base64.b64encode(encoded_frame).decode("ascii")
+        camera_frame.markdown(
+            f"<img src='data:image/jpeg;base64,{image_data}' "
+            "style='width:100%;height:auto;border-radius:10px' "
+            "alt='Live webcam frame'>",
+            unsafe_allow_html=True,
+        )
+        st.session_state["last_display_ts"] = now
+    camera_status.caption(
+        "Face detected" if result.face_found else "No face detected — adjust lighting or position"
+    )
 
-                # Keep chart history bounded
-                if len(st.session_state["history"]) > HISTORY_ROWS:
-                    st.session_state["history"] = st.session_state["history"][-HISTORY_ROWS:]
+    if now - st.session_state["last_sample_ts"] >= SAMPLE_INTERVAL_SECS:
+        window_features = buffer.aggregate()
+        st.session_state["last_sample_ts"] = now
+        if window_features is not None:
+            record = make_estimate(window_features, now, buffer.buffer_size)
+            history = st.session_state["history"]
+            history.append(record)
+            st.session_state["history"] = history[-HISTORY_ROWS:]
 
-                # -- badge -------------------------------------------------
-                emoji_label, color = LOAD_BADGE[load_name]
-                badge_placeholder.markdown(
-                    f"<div style='background:{color};padding:10px;border-radius:8px;"
-                    f"text-align:center;font-size:1.4em;color:white'>{emoji_label}</div>",
-                    unsafe_allow_html=True,
-                )
+            if st.session_state["record_data"]:
+                if st.session_state["session_name"] is None:
+                    st.session_state["session_name"] = datetime.now().strftime(
+                        "%Y%m%d_%H%M%S"
+                    )
+                    st.session_state["session_started_at"] = now
+                st.session_state["session_history"].append(record)
 
-                # -- High-load alert ---------------------------------------
-                if alert_on:
-                    if load_name == "High":
-                        if st.session_state["high_since"] is None:
-                            st.session_state["high_since"] = ts
-                        elif ts - st.session_state["high_since"] >= ALERT_SECS:
-                            alert_placeholder.warning(
-                                "⚠️ **High cognitive load detected for >60 s. "
-                                "Consider taking a short break!**"
-                            )
-                            st.session_state["alert_shown"] = True
-                    else:
-                        st.session_state["high_since"] = None
-                        if st.session_state["alert_shown"]:
-                            alert_placeholder.empty()
-                            st.session_state["alert_shown"] = False
+            render_live_metrics(live_load, metric_row)
+            render_live_trends(trend_container)
+            update_load_alert(record, alert_status)
+        else:
+            camera_status.caption(
+                "Collecting valid face frames; estimates appear after enough landmarks "
+                "are available."
+            )
 
-                # -- charts ------------------------------------------------
-                hist_df = pd.DataFrame(st.session_state["history"])
-                chart_ear.line_chart(hist_df[["ear_mean_avg"]].rename(columns={"ear_mean_avg": "EAR"}))
-                chart_blink.line_chart(hist_df[["blink_rate"]].rename(columns={"blink_rate": "Blink Rate (bpm)"}))
-                chart_perclos.line_chart(hist_df[["perclos"]].rename(columns={"perclos": "PERCLOS"}))
-                chart_load.line_chart(hist_df[["load_label"]].rename(columns={"load_label": "Load (0=Low 2=High)"}))
 
-            # -- Streamlit: check for stop signal --------------------------
-            if not run_camera:
-                break
+def make_estimate(
+    features: WindowFeatures, timestamp: float, buffered_frames: int
+) -> dict[str, float | int | str | None]:
+    confidence: float | None = None
+    if model is not None:
+        label, probabilities = model.predict(features.to_vector())
+        load_name = LABEL_NAMES[label]
+        confidence = max(probabilities.values(), default=0.0) * 100.0
+        prediction_mode = "Trained model"
+    else:
+        label, load_name = rule_based_load(features)
+        prediction_mode = "Rule-based fallback"
 
-            frame_time = time.perf_counter() - frame_started
-            time.sleep(max(0.0, (1.0 / 30.0) - frame_time))
+    record = features.to_dict()
+    record.update(
+        {
+            "timestamp": timestamp,
+            "load_label": label,
+            "load_name": load_name,
+            "confidence": confidence,
+            "prediction_mode": prediction_mode,
+            "face_quality_pct": (
+                features.n_frames / max(buffered_frames, 1) * 100.0
+            ),
+        }
+    )
+    return record
 
-    finally:
-        cam.release()
-        fme.close()
 
-else:
-    frame_placeholder.info("👆 Toggle **Start Camera** in the sidebar to begin.")
+def render_live_metrics(live_load: Any, metric_row: Any) -> None:
+    history = st.session_state["history"]
+    if not history:
+        return
+    latest = history[-1]
+    name = str(latest["load_name"])
+    emoji, color = LOAD_STYLE.get(name, LOAD_STYLE["Unknown"])
+    confidence = latest.get("confidence")
+    confidence_text = (
+        f"{float(confidence):.0f}% model confidence"
+        if confidence is not None
+        else "Heuristic estimate"
+    )
+    live_load.markdown(
+        f"<div style='background:{color};padding:14px 18px;border-radius:10px;"
+        f"color:white;font-size:1.5rem;font-weight:650'>"
+        f"{emoji} Current estimate: {name}"
+        f"<div style='font-size:.85rem;font-weight:400'>{confidence_text}</div></div>",
+        unsafe_allow_html=True,
+    )
+    with metric_row:
+        columns = st.columns(4)
+        columns[0].metric("Blink rate", f"{float(latest['blink_rate']):.1f}/min")
+        columns[1].metric("PERCLOS", f"{float(latest['perclos']) * 100:.1f}%")
+        columns[2].metric("Mean EAR", f"{float(latest['ear_mean_avg']):.3f}")
+        columns[3].metric("Face coverage", f"{float(latest['face_quality_pct']):.0f}%")
+
+
+def render_live_trends(trend_container: Any) -> None:
+    if not st.session_state["history"]:
+        return
+    data = pd.DataFrame(st.session_state["history"])
+    data["time"] = pd.to_datetime(data["timestamp"], unit="s")
+    data = data.set_index("time")
+    with trend_container:
+        st.subheader("Recent trends")
+        chart_columns = st.columns(2)
+        chart_columns[0].line_chart(data[["ear_mean_avg"]].rename(columns={"ear_mean_avg": "EAR"}))
+        chart_columns[1].line_chart(data[["blink_rate"]].rename(columns={"blink_rate": "Blinks/min"}))
+        chart_columns[0].line_chart(data[["perclos"]].rename(columns={"perclos": "PERCLOS"}))
+        chart_columns[1].line_chart(
+            data[["load_label"]].rename(columns={"load_label": "Load class · 0 Low / 2 High"})
+        )
+
+
+def update_load_alert(
+    record: dict[str, float | int | str | None], alert_status: Any
+) -> None:
+    if not st.session_state["alert_on"]:
+        alert_status.empty()
+        st.session_state["high_since"] = None
+        return
+
+    timestamp = float(record["timestamp"])
+    if record["load_name"] == "High":
+        if st.session_state["high_since"] is None:
+            st.session_state["high_since"] = timestamp
+        elif timestamp - st.session_state["high_since"] >= 60:
+            alert_status.warning(
+                "High-load estimates have persisted for about one minute. "
+                "Consider a pause and check how you feel."
+            )
+    else:
+        st.session_state["high_since"] = None
+        alert_status.empty()
+
+
+@st.fragment(run_every=1.0)
+def render_session_brief() -> None:
+    records = st.session_state["session_history"]
+    if not records:
+        st.info(
+            "Enable **Record this session** and start the camera. "
+            "A brief report becomes available after the first valid estimate."
+        )
+        return
+
+    session_name = st.session_state["session_name"] or "cognitive_load_session"
+    metrics, report = build_session_report(records, session_name)
+    st.subheader("Session at a glance")
+    summary_columns = st.columns(4)
+    summary_columns[0].metric("Recorded estimates", metrics["sample_count"])
+    summary_columns[1].metric("Dominant estimate", metrics["dominant_load"])
+    summary_columns[2].metric("High-load share", f"{metrics['high_percent']:.1f}%")
+    summary_columns[3].metric(
+        "Observed span", format_duration(metrics["duration_seconds"])
+    )
+
+    distribution = pd.DataFrame.from_dict(
+        metrics["distribution"], orient="index", columns=["Share (%)"]
+    )
+    report_columns = st.columns([1, 1.5])
+    with report_columns[0]:
+        st.caption("Distribution of recorded load estimates")
+        st.bar_chart(distribution, horizontal=True)
+    with report_columns[1]:
+        st.markdown(report)
+
+    csv_data = pd.DataFrame(records).to_csv(index=False)
+    st.download_button(
+        "Download session data (CSV)",
+        data=csv_data,
+        file_name=f"{session_name}.csv",
+        mime="text/csv",
+        key="download_session_csv",
+    )
+    if st.button("Save CSV in project data/sessions", key="save_session_csv"):
+        SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        csv_path = SESSION_DIR / f"{session_name}.csv"
+        csv_path.write_text(csv_data, encoding="utf-8")
+        st.success(f"Saved session data to {csv_path}")
+    st.download_button(
+        "Download brief report (Markdown)",
+        data=report,
+        file_name=f"{session_name}_brief.md",
+        mime="text/markdown",
+        key="download_session_brief",
+    )
+
+
+with live_tab:
+    render_live_monitor()
+
+with report_tab:
+    st.header("Session brief")
+    st.caption(
+        "A concise summary of estimates recorded while **Record this session** was enabled."
+    )
+    render_session_brief()
+
+with guidance_tab:
+    st.header("Reading the estimates")
+    st.markdown(
+        """
+        - **EAR** summarizes eye openness; lower values can indicate eye closure.
+        - **Blink rate** and **PERCLOS** summarize ocular behavior over the rolling window.
+        - **Head pose, brow proxy, and gaze stability** are approximate visual features.
+        - **Low / Medium / High** are model estimates, not direct measurements of mental state.
+        - Compare results with the task context and self-reported NASA-TLX ratings.
+
+        For a useful report, record a complete task and label it separately with
+        its NASA-TLX score. Lighting, camera position, glasses, and face visibility
+        can affect the measurements.
+        """
+    )

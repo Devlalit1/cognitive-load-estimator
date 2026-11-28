@@ -87,8 +87,11 @@ streamlit run src/dashboard.py
 ```
 
 The dashboard records one aggregated 30-second feature row at a time. Use
-**Record Session** and **Export Session CSV** to save data under
-`data/sessions/`; add a matching NASA-TLX label file under `data/labels/`
+**Record this session** to capture estimates. The **Session brief** tab shows
+the load distribution, dominant estimate, high-load share, signal averages,
+face-detection coverage, and a short interpretation. Download the brief as
+Markdown and the recorded estimates as CSV, or save the CSV under
+`data/sessions/`. Add a matching NASA-TLX label file under `data/labels/`
 before training:
 
 ```bash
