@@ -221,3 +221,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local project environments
+cogload-env/
+cogload-py311/
+
+# Locally recorded facial feature data and trained artifacts
+data/sessions/*.csv
+data/labels/*
+!data/labels/.gitkeep
+data/trained_model.pkl
+data/scaler.pkl
